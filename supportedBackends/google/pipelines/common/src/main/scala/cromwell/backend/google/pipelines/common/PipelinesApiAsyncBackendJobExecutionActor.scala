@@ -24,7 +24,7 @@ import cromwell.backend.google.pipelines.common.api.clients.{PipelinesApiAbortCl
 import cromwell.backend.google.pipelines.common.authentication.PipelinesApiDockerCredentials
 import cromwell.backend.google.pipelines.common.errors.FailedToDelocalizeFailure
 import cromwell.backend.google.pipelines.common.io._
-import cromwell.backend.google.pipelines.common.monitoring.MonitoringImage
+import cromwell.backend.google.pipelines.common.monitoring.{CheckpointingConfiguration, MonitoringImage}
 import cromwell.backend.io.DirectoryFunctions
 import cromwell.backend.standard.{StandardAdHocValue, StandardAsyncExecutionActor, StandardAsyncExecutionActorParams, StandardAsyncJob}
 import cromwell.core._
@@ -99,6 +99,7 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
     with PipelinesApiStatusRequestClient
     with PipelinesApiRunCreationClient
     with PipelinesApiAbortClient
+    with PipelinesApiReferenceFilesMappingOperations
     with PapiInstrumentation {
 
   override lazy val ioCommandBuilder: IoCommandBuilder = GcsBatchCommandBuilder
@@ -152,7 +153,9 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
 
   override def requestsAbortAndDiesImmediately: Boolean = false
 
+  /*_*/ // Silence an errant IntelliJ warning
   override def receive: Receive = pollingActorClientReceive orElse runCreationClientReceive orElse abortActorClientReceive orElse kvClientReceive orElse super.receive
+  /*_*/ // https://stackoverflow.com/questions/36679973/controlling-false-intellij-code-editor-error-in-scala-plugin
 
   private def gcsAuthParameter: Option[PipelinesApiLiteralInput] = {
     if (jesAttributes.auths.gcs.requiresAuthFile || dockerConfiguration.isDefined)
@@ -200,12 +203,13 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
   }
 
   override lazy val inputsToNotLocalize: Set[WomFile] = {
-    val unmapped = jobDescriptor.findInputFilesByParameterMeta {
+    val localizeOptional = jobDescriptor.findInputFilesByParameterMeta {
       case MetaValueElementObject(values) => values.get("localization_optional").contains(MetaValueElementBoolean(true))
       case _ => false
     }
-    val cloudMapped = unmapped.map(cloudResolveWomFile)
-    unmapped ++ cloudMapped
+    val localizeSkipped = localizeOptional.filter(canSkipLocalize)
+    val localizeMapped = localizeSkipped.map(cloudResolveWomFile)
+    localizeSkipped ++ localizeMapped
   }
 
   protected def callInputFiles: Map[FullyQualifiedName, Seq[WomFile]] = {
@@ -410,6 +414,10 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
     descriptor.workflowOptions.getBoolean(WorkflowOptionKeys.GoogleLegacyMachineSelection).getOrElse(false)
   }
 
+  protected def useDockerImageCache(descriptor: BackendWorkflowDescriptor): Boolean = {
+    descriptor.workflowOptions.getBoolean(WorkflowOptionKeys.UseDockerImageCache).getOrElse(false)
+  }
+
   override def isTerminal(runStatus: RunStatus): Boolean = {
     runStatus match {
       case _: TerminalRunStatus => true
@@ -448,7 +456,8 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
         } getOrElse runtimeAttributes.disks
 
         val inputFilePaths = inputOutputParameters.jobInputParameters.map(_.cloudPath.pathAsString).toSet
-        val referenceDisksToMount = PipelinesApiReferenceFilesMapping.getReferenceDisksToMount(jesAttributes.referenceFilesMapping, inputFilePaths)
+        val referenceDisksToMount =
+          jesAttributes.referenceFileToDiskImageMappingOpt.map(getReferenceDisksToMount(_, inputFilePaths))
 
         val workflowOptions = workflowDescriptor.workflowOptions
 
@@ -460,6 +469,14 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
             commandDirectory = commandDirectory,
             workingDisk = workingDisk,
             localMonitoringImageScriptPath = localMonitoringImageScriptPath,
+          )
+
+        val checkpointingConfiguration =
+          new CheckpointingConfiguration(
+            jobDescriptor = jobDescriptor,
+            workflowPaths = workflowPaths,
+            commandDirectory = commandDirectory,
+            pipelinesConfiguration.papiAttributes.checkpointingInterval
           )
 
         val enableSshAccess = workflowOptions.getBoolean(WorkflowOptionKeys.EnableSSHAccess).toOption.contains(true)
@@ -486,10 +503,13 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
           retryWithMoreMemoryKeys = jesAttributes.memoryRetryConfiguration.map(_.errorKeys),
           fuseEnabled = fuseEnabled(jobDescriptor.workflowDescriptor),
           allowNoAddress = pipelinesConfiguration.papiAttributes.allowNoAddress,
-          referenceDisksForLocalization = referenceDisksToMount,
+          referenceDisksForLocalizationOpt = referenceDisksToMount,
           monitoringImage = monitoringImage,
+          checkpointingConfiguration,
           enableSshAccess = enableSshAccess,
-          vpcNetworkAndSubnetworkProjectLabels = data.vpcNetworkAndSubnetworkProjectLabels
+          vpcNetworkAndSubnetworkProjectLabels = data.vpcNetworkAndSubnetworkProjectLabels,
+          useDockerImageCache = runtimeAttributes.useDockerImageCache.getOrElse(useDockerImageCache(jobDescriptor.workflowDescriptor)),
+          dockerImageToCacheDiskImageMappingOpt = jesAttributes.dockerImageToCacheDiskImageMappingOpt
         )
       case Some(other) =>
         throw new RuntimeException(s"Unexpected initialization data: $other")
@@ -523,7 +543,7 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
                                             cloudPath: Path,
                                             transferLibraryContainerPath: Path,
                                             gcsTransferConfiguration: GcsTransferConfiguration,
-                                            referenceFilesMapping: PipelinesApiReferenceFilesMapping): Future[Unit] = Future.successful(())
+                                            referenceFileToDiskImageMapping: Option[Map[String, PipelinesApiReferenceFilesDisk]]): Future[Unit] = Future.successful(())
 
   protected def uploadGcsDelocalizationScript(createPipelineParameters: CreatePipelineParameters,
                                               cloudPath: Path,
@@ -597,7 +617,7 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
       transferLibraryContainerPath = createParameters.commandScriptContainerPath.sibling(GcsTransferLibraryName)
       _ <- uploadGcsTransferLibrary(createParameters, gcsTransferLibraryCloudPath, gcsTransferConfiguration)
       gcsLocalizationScriptCloudPath = jobPaths.callExecutionRoot / PipelinesApiJobPaths.GcsLocalizationScriptName
-      _ <- uploadGcsLocalizationScript(createParameters, gcsLocalizationScriptCloudPath, transferLibraryContainerPath, gcsTransferConfiguration, jesAttributes.referenceFilesMapping)
+      _ <- uploadGcsLocalizationScript(createParameters, gcsLocalizationScriptCloudPath, transferLibraryContainerPath, gcsTransferConfiguration, jesAttributes.referenceFileToDiskImageMappingOpt)
       gcsDelocalizationScriptCloudPath = jobPaths.callExecutionRoot / PipelinesApiJobPaths.GcsDelocalizationScriptName
       _ <- uploadGcsDelocalizationScript(createParameters, gcsDelocalizationScriptCloudPath, transferLibraryContainerPath, gcsTransferConfiguration)
       _ = this.hasDockerCredentials = createParameters.privateDockerKeyAndEncryptedToken.isDefined
@@ -818,10 +838,27 @@ class PipelinesApiAsyncBackendJobExecutionActor(override val standardParams: Sta
     }
   }
 
+  private def canSkipLocalize(womFile: WomFile): Boolean = {
+    var canSkipLocalize = true
+    womFile.mapFile { value =>
+      getPath(value) match {
+        case Success(drsPath: DrsPath) =>
+          val gsUriOption = DrsResolver.getSimpleGsUri(drsPath).unsafeRunSync()
+          if (gsUriOption.isEmpty) {
+            canSkipLocalize = false
+          }
+        case _ => /* ignore */
+      }
+      value
+    }
+    canSkipLocalize
+  }
+
   override def cloudResolveWomFile(womFile: WomFile): WomFile = {
     womFile.mapFile { value =>
       getPath(value) match {
-        case Success(drsPath: DrsPath) => DrsResolver.getGsUri(drsPath).unsafeRunSync()
+        case Success(drsPath: DrsPath) => DrsResolver.getSimpleGsUri(drsPath).unsafeRunSync().getOrElse(value)
+        case Success(path) => path.pathAsString
         case _ => value
       }
     }
